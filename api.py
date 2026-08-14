@@ -5,110 +5,83 @@ import concurrent.futures
 import os
 import re
 import requests
-
-from typing import Any, Dict, List, Optional
+from urllib.parse import urlparse
 
 
 app = FastAPI(
     title="SearchPhone API",
-    version="3.0.0"
+    version="4.0.0"
 )
 
 
 # =========================================================
-# ENVIRONMENT KEYS
+# API KEYS
 # =========================================================
 
 IPQS_KEY = os.getenv("IPQS_KEY", "")
+PDL_API_KEY = os.getenv("PDL_API_KEY", "")
 SERPAPI_KEY = os.getenv("SERPAPI_KEY", "")
 
 
 # =========================================================
-# HOME / HEALTH CHECK
+# HOME
 # =========================================================
 
 @app.get("/")
 def home():
     return {
         "status": "online",
-        "message": "SearchPhone API v3 is running"
+        "message": "SearchPhone API v4 is running"
     }
 
 
 # =========================================================
-# PHONE NUMBER FORMATS
+# HELPERS
 # =========================================================
 
-def unique_add(items: List[str], value: Optional[str]) -> None:
-    if value and value not in items:
-        items.append(value)
+def safe_call(function, *args):
+    try:
+        return function(*args)
+    except Exception as e:
+        return {"error": str(e)}
 
 
-def phone_variants(phone: str, region: str = "AE") -> List[str]:
+def safe_string(value):
+    return value if isinstance(value, str) and value.strip() else None
 
+
+def phone_variants(phone: str, region: str = "AE"):
     digits = re.sub(r"\D", "", phone)
 
-    variants: List[str] = []
+    variants = []
 
-    unique_add(variants, phone.strip())
+    def add(value):
+        if value and value not in variants:
+            variants.append(value)
+
+    add(phone.strip())
 
     if digits:
-        unique_add(variants, digits)
-        unique_add(variants, f"+{digits}")
+        add(digits)
+        add("+" + digits)
 
-    # UAE formats
+    # UAE local/international conversions
     if region.upper() == "AE":
 
-        # Example:
-        # +971551234567 -> 0551234567
-        if digits.startswith("971") and len(digits) >= 11:
+        if digits.startswith("971") and len(digits) == 12:
+            national = digits[3:]
+            local = "0" + national
 
-            national_digits = digits[3:]
+            add(local)
+            add(f"{local[:3]} {local[3:6]} {local[6:]}")
+            add(f"+971 {national[:2]} {national[2:5]} {national[5:]}")
 
-            local = "0" + national_digits
-
-            unique_add(
-                variants,
-                local
-            )
-
-            # Example:
-            # 055 123 4567
-            if len(local) == 10:
-
-                unique_add(
-                    variants,
-                    f"{local[:3]} {local[3:6]} {local[6:]}"
-                )
-
-            # Example:
-            # +971 55 123 4567
-            if len(national_digits) == 9:
-
-                unique_add(
-                    variants,
-                    f"+971 {national_digits[:2]} "
-                    f"{national_digits[2:5]} "
-                    f"{national_digits[5:]}"
-                )
-
-        # Convert local UAE number to international
         elif digits.startswith("0") and len(digits) == 10:
+            international = "971" + digits[1:]
 
-            international_digits = "971" + digits[1:]
-
-            unique_add(
-                variants,
-                f"+{international_digits}"
-            )
-
-            unique_add(
-                variants,
-                international_digits
-            )
-
-            unique_add(
-                variants,
+            add("+" + international)
+            add(international)
+            add(
                 f"+971 {digits[1:3]} "
                 f"{digits[3:6]} "
                 f"{digits[6:]}"
@@ -117,33 +90,18 @@ def phone_variants(phone: str, region: str = "AE") -> List[str]:
     return variants
 
 
-def choose_e164_like(
-    variants: List[str],
-    original: str
-) -> str:
-
-    for item in variants:
-
-        if item.startswith("+") and " " not in item:
-
-            return item
+def choose_e164(variants, original):
+    for value in variants:
+        if value.startswith("+") and " " not in value:
+            return value
 
     return original
 
 
-def choose_local_plain(
-    variants: List[str]
-) -> Optional[str]:
-
-    for item in variants:
-
-        if (
-            item.startswith("0")
-            and " " not in item
-            and item.isdigit()
-        ):
-
-            return item
+def choose_local(variants):
+    for value in variants:
+        if value.startswith("0") and value.isdigit():
+            return value
 
     return None
 
@@ -152,257 +110,267 @@ def choose_local_plain(
 # IPQUALITYSCORE
 # =========================================================
 
-def check_ipqs(
-    phone: str,
-    region: str
-) -> Dict[str, Any]:
-
+def check_ipqs(phone, region="AE"):
     if not IPQS_KEY:
-
         return {
             "success": False,
             "message": "IPQS_KEY is not configured"
         }
 
     try:
-
-        clean_phone = re.sub(
-            r"[^\d+]",
-            "",
-            phone
-        )
-
         response = requests.get(
-
             "https://ipqualityscore.com/api/json/phone",
-
             headers={
                 "IPQS-KEY": IPQS_KEY
             },
-
             params={
-                "phone": clean_phone,
+                "phone": phone,
                 "strictness": 1,
                 "country[]": region.upper()
             },
-
             timeout=20
         )
 
         try:
-
-            data = response.json()
-
+            return response.json()
         except Exception:
-
             return {
                 "success": False,
                 "status_code": response.status_code,
                 "message": response.text[:500]
             }
 
-        if response.status_code != 200:
-
-            return {
-                "success": False,
-                "status_code": response.status_code,
-                "response": data
-            }
-
-        return data
-
     except Exception as e:
-
         return {
             "success": False,
             "message": str(e)
         }
 
 
-# =========================================================
-# SIMPLIFY IPQS IDENTITY DATA
-# =========================================================
-
-def simplify_ipqs(
-    data: Dict[str, Any]
-) -> Dict[str, Any]:
-
+def simplify_ipqs(data):
     if not isinstance(data, dict):
-
         return {}
 
     name = data.get("name")
 
-    if name in (
-        None,
-        "",
-        "N/A"
-    ):
-
+    if name in ("N/A", "", None):
         name = None
 
-    emails: List[Any] = []
+    email_data = data.get("associated_email_addresses", {})
 
-    email_data = data.get(
-        "associated_email_addresses"
-    )
+    emails = []
 
     if isinstance(email_data, dict):
+        possible = email_data.get("emails", [])
 
-        possible_emails = email_data.get(
-            "emails",
-            []
-        )
-
-        if isinstance(
-            possible_emails,
-            list
-        ):
-
-            emails = possible_emails
+        if isinstance(possible, list):
+            emails = [
+                x for x in possible
+                if isinstance(x, str)
+            ]
 
     return {
-
-        # Identity
         "name": name,
-
         "associated_emails": emails,
-
-        # Higher IPQS plans may return this
-        "identity_data": data.get(
-            "identity_data"
-        ),
-
-        # Phone information
         "valid": data.get("valid"),
-
         "active": data.get("active"),
+        "carrier": data.get("carrier"),
+        "line_type": data.get("line_type"),
+        "country": data.get("country"),
+        "region": data.get("region"),
+        "city": data.get("city"),
+        "timezone": data.get("timezone"),
+        "fraud_score": data.get("fraud_score"),
+        "recent_abuse": data.get("recent_abuse"),
+        "risky": data.get("risky"),
+        "spammer": data.get("spammer"),
+        "leaked": data.get("leaked"),
+        "VOIP": data.get("VOIP"),
+        "prepaid": data.get("prepaid")
+    }
 
-        "active_status": data.get(
-            "active_status"
+
+# =========================================================
+# PEOPLE DATA LABS
+# =========================================================
+
+def check_pdl(phone, region="AE"):
+    if not PDL_API_KEY:
+        return {
+            "matched": False,
+            "message": "PDL_API_KEY is not configured"
+        }
+
+    params = {
+        "phone": phone,
+        "min_likelihood": 6
+    }
+
+    # Extra country hint for UAE numbers
+    if region.upper() == "AE":
+        params["country"] = "United Arab Emirates"
+
+    try:
+        response = requests.get(
+            "https://api.peopledatalabs.com/v5/person/enrich",
+            headers={
+                "X-Api-Key": PDL_API_KEY
+            },
+            params=params,
+            timeout=25
+        )
+
+        if response.status_code == 404:
+            return {
+                "matched": False,
+                "status_code": 404,
+                "message": "No PDL profile matched this phone number"
+            }
+
+        try:
+            data = response.json()
+        except Exception:
+            return {
+                "matched": False,
+                "status_code": response.status_code,
+                "message": response.text[:500]
+            }
+
+        if response.status_code != 200:
+            return {
+                "matched": False,
+                "status_code": response.status_code,
+                "response": data
+            }
+
+        return {
+            "matched": True,
+            "status_code": 200,
+            "likelihood": data.get("likelihood"),
+            "data": data.get("data", {})
+        }
+
+    except Exception as e:
+        return {
+            "matched": False,
+            "message": str(e)
+        }
+
+
+def simplify_pdl(result):
+    if not isinstance(result, dict):
+        return {
+            "matched": False
+        }
+
+    if not result.get("matched"):
+        return {
+            "matched": False,
+            "likelihood": None
+        }
+
+    data = result.get("data", {})
+
+    if not isinstance(data, dict):
+        data = {}
+
+    # Free PDL accounts may return True/False instead of
+    # contact values. Only expose actual strings.
+    work_email = safe_string(data.get("work_email"))
+
+    return {
+        "matched": True,
+        "likelihood": result.get("likelihood"),
+
+        "full_name": safe_string(
+            data.get("full_name")
         ),
 
-        "formatted": data.get(
-            "formatted"
+        "first_name": safe_string(
+            data.get("first_name")
         ),
 
-        "local_format": data.get(
-            "local_format"
+        "last_name": safe_string(
+            data.get("last_name")
         ),
 
-        "carrier": data.get(
-            "carrier"
+        "work_email": work_email,
+
+        "work_email_available": (
+            bool(data.get("work_email"))
+            if isinstance(data.get("work_email"), bool)
+            else bool(work_email)
         ),
 
-        "line_type": data.get(
-            "line_type"
+        "job_title": safe_string(
+            data.get("job_title")
         ),
 
-        "country": data.get(
-            "country"
+        "job_company_name": safe_string(
+            data.get("job_company_name")
         ),
 
-        "region": data.get(
-            "region"
+        "job_company_website": safe_string(
+            data.get("job_company_website")
         ),
 
-        "city": data.get(
-            "city"
+        "industry": safe_string(
+            data.get("industry")
         ),
 
-        "timezone": data.get(
-            "timezone"
+        "linkedin_url": safe_string(
+            data.get("linkedin_url")
         ),
 
-        # Risk information
-        "fraud_score": data.get(
-            "fraud_score"
+        "facebook_url": safe_string(
+            data.get("facebook_url")
         ),
 
-        "recent_abuse": data.get(
-            "recent_abuse"
+        "twitter_url": safe_string(
+            data.get("twitter_url")
         ),
 
-        "risky": data.get(
-            "risky"
+        "github_url": safe_string(
+            data.get("github_url")
         ),
 
-        "spammer": data.get(
-            "spammer"
-        ),
-
-        "leaked": data.get(
-            "leaked"
-        ),
-
-        "VOIP": data.get(
-            "VOIP"
-        ),
-
-        "prepaid": data.get(
-            "prepaid"
-        ),
-
-        "user_activity": data.get(
-            "user_activity"
+        "location_name": safe_string(
+            data.get("location_name")
         )
     }
 
 
 # =========================================================
-# SERPAPI BASE REQUEST
+# SERPAPI
 # =========================================================
 
-def serpapi_request(
-    params: Dict[str, Any]
-) -> Dict[str, Any]:
-
+def serpapi_request(params):
     if not SERPAPI_KEY:
-
         return {
             "success": False,
             "message": "SERPAPI_KEY is not configured"
         }
 
-    full_params = dict(params)
-
-    full_params["api_key"] = SERPAPI_KEY
+    request_params = dict(params)
+    request_params["api_key"] = SERPAPI_KEY
 
     try:
-
         response = requests.get(
-
             "https://serpapi.com/search",
-
-            params=full_params,
-
+            params=request_params,
             timeout=25
         )
 
         try:
-
-            data = response.json()
-
+            return response.json()
         except Exception:
-
             return {
                 "success": False,
                 "status_code": response.status_code,
                 "message": response.text[:500]
             }
 
-        if response.status_code != 200:
-
-            return {
-                "success": False,
-                "status_code": response.status_code,
-                "response": data
-            }
-
-        return data
-
     except Exception as e:
-
         return {
             "success": False,
             "message": str(e)
@@ -410,227 +378,224 @@ def serpapi_request(
 
 
 # =========================================================
-# STRONGER GOOGLE SEARCH
+# FILTER JUNK GOOGLE RESULTS
 # =========================================================
 
-def search_google_enriched(
-    e164: str,
-    local: Optional[str],
-    region: str
-) -> List[Dict[str, Any]]:
+def looks_like_junk_result(title, snippet, link):
+    text = f"{title} {snippet}".lower()
 
-    numbers = [
-        f'"{e164}"'
-    ]
-
-    if local:
-
-        numbers.append(
-            f'"{local}"'
-        )
-
-    number_query = " OR ".join(
-        numbers
+    # Many unrelated phone-number-like strings
+    number_count = len(
+        re.findall(r"\b0\d{8,10}\b", text)
     )
 
-    # Look for public contact/profile/business pages
+    hostname = ""
+
+    try:
+        hostname = urlparse(link).hostname or ""
+    except Exception:
+        pass
+
+    if (
+        title.lower().strip() == "untitled"
+        and number_count >= 5
+    ):
+        return True
+
+    if (
+        number_count >= 8
+        and (
+            "cloudfront.net" in hostname
+            or "web.core.windows.net" in hostname
+        )
+    ):
+        return True
+
+    return False
+
+
+# =========================================================
+# GOOGLE ENRICHED SEARCH
+# =========================================================
+
+def search_google_enriched(e164, local=None, region="AE"):
+    exact_numbers = [f'"{e164}"']
+
+    if local:
+        exact_numbers.append(f'"{local}"')
+
+    number_query = " OR ".join(exact_numbers)
+
     query = (
-
         f"({number_query}) "
-
-        f"(contact OR caller OR phone OR mobile "
-        f"OR WhatsApp OR business "
-
+        f"(name OR contact OR mobile OR phone OR whatsapp "
+        f"OR company OR business "
+        f"OR site:linkedin.com "
         f"OR site:facebook.com "
         f"OR site:instagram.com "
-        f"OR site:linkedin.com "
         f"OR site:x.com "
         f"OR site:tiktok.com)"
     )
 
     data = serpapi_request({
-
         "engine": "google",
-
         "q": query,
-
         "hl": "en",
-
         "gl": region.lower(),
-
         "num": 20
     })
 
-    results: List[Dict[str, Any]] = []
+    results = []
 
     if not isinstance(data, dict):
-
         return results
 
-    for item in data.get(
-        "organic_results",
-        []
-    ):
+    for item in data.get("organic_results", []):
+        title = item.get("title", "")
+        link = item.get("link", "")
+        snippet = item.get("snippet", "")
+
+        if looks_like_junk_result(
+            title,
+            snippet,
+            link
+        ):
+            continue
 
         results.append({
-
-            "title": item.get(
-                "title",
-                ""
-            ),
-
-            "link": item.get(
-                "link",
-                ""
-            ),
-
-            "snippet": item.get(
-                "snippet",
-                ""
-            ),
-
-            "source": item.get(
-                "source",
-                ""
-            )
+            "title": title,
+            "link": link,
+            "snippet": snippet,
+            "source": item.get("source", "")
         })
 
     return results
 
 
 # =========================================================
-# GOOGLE MAPS / BUSINESS LOOKUP
+# GOOGLE MAPS / BUSINESS SEARCH
 # =========================================================
 
-def search_google_maps(
-    e164: str,
-    local: Optional[str]
-) -> List[Dict[str, Any]]:
-
+def search_google_maps(e164, local=None):
     query = local or e164
 
     data = serpapi_request({
-
         "engine": "google_maps",
-
         "type": "search",
-
         "q": query,
-
         "hl": "en"
     })
 
-    results: List[Dict[str, Any]] = []
+    results = []
 
     if not isinstance(data, dict):
-
         return results
 
-    for item in data.get(
-        "local_results",
-        []
-    ):
-
+    for item in data.get("local_results", []):
         results.append({
-
-            "title": item.get(
-                "title",
-                ""
-            ),
-
-            "type": item.get(
-                "type",
-                ""
-            ),
-
-            "address": item.get(
-                "address",
-                ""
-            ),
-
-            "phone": item.get(
-                "phone",
-                ""
-            ),
-
-            "website": item.get(
-                "website",
-                ""
-            ),
-
-            "description": item.get(
-                "description",
-                ""
-            ),
-
-            "rating": item.get(
-                "rating"
-            ),
-
-            "reviews": item.get(
-                "reviews"
-            ),
-
-            "gps_coordinates": item.get(
-                "gps_coordinates"
-            ),
-
-            "data_id": item.get(
-                "data_id"
-            )
+            "title": item.get("title"),
+            "type": item.get("type"),
+            "address": item.get("address"),
+            "phone": item.get("phone"),
+            "website": item.get("website"),
+            "description": item.get("description"),
+            "rating": item.get("rating"),
+            "reviews": item.get("reviews")
         })
 
     return results
 
 
 # =========================================================
-# SAFE FUNCTION CALL
+# BUILD BEST IDENTITY
 # =========================================================
 
-def safe_call(
-    function,
-    *args
-):
+def normalize_name(name):
+    if not isinstance(name, str):
+        return None
 
-    try:
+    return re.sub(
+        r"[^a-z0-9]",
+        "",
+        name.lower()
+    )
 
-        return function(
-            *args
-        )
 
-    except Exception as e:
+def build_best_identity(ipqs, pdl):
+    ipqs_name = ipqs.get("name")
+    pdl_name = pdl.get("full_name")
+    likelihood = pdl.get("likelihood")
 
+    # Both databases agree
+    if (
+        ipqs_name
+        and pdl_name
+        and normalize_name(ipqs_name)
+        == normalize_name(pdl_name)
+    ):
         return {
-            "error": str(e)
+            "name": pdl_name,
+            "confidence": "high",
+            "sources": [
+                "IPQualityScore",
+                "People Data Labs"
+            ]
         }
 
+    # Strong PDL match
+    if pdl_name:
+        confidence = "medium"
+
+        if isinstance(likelihood, (int, float)):
+            if likelihood >= 8:
+                confidence = "high"
+            elif likelihood >= 6:
+                confidence = "medium"
+            else:
+                confidence = "low"
+
+        return {
+            "name": pdl_name,
+            "confidence": confidence,
+            "sources": [
+                "People Data Labs"
+            ],
+            "pdl_likelihood": likelihood
+        }
+
+    # IPQS only
+    if ipqs_name:
+        return {
+            "name": ipqs_name,
+            "confidence": "medium",
+            "sources": [
+                "IPQualityScore"
+            ]
+        }
+
+    return {
+        "name": None,
+        "confidence": "none",
+        "sources": []
+    }
+
 
 # =========================================================
-# MAIN SEARCH ENDPOINT
+# MAIN SEARCH
 # =========================================================
 
 @app.get("/search")
 def search_phone(
-
     phone: str = Query(
         ...,
-        description=(
-            "Phone number, preferably with "
-            "international country code"
-        )
+        description="Phone number, preferably international format"
     ),
-
     region: str = Query(
         "AE",
-        description=(
-            "Two-letter country code, "
-            "for example AE"
-        )
+        description="Two-letter country code"
     )
 ):
-
     try:
-
         region = region.upper()
 
         osint = PhoneOSINT()
@@ -640,34 +605,33 @@ def search_phone(
             region
         )
 
-        main_number = choose_e164_like(
+        main_number = choose_e164(
             variants,
             phone
         )
 
-        local_number = choose_local_plain(
+        local_number = choose_local(
             variants
         )
 
-
-        # =================================================
-        # RUN SOURCES TOGETHER
-        # =================================================
-
+        # Run services together
         with concurrent.futures.ThreadPoolExecutor(
-            max_workers=10
+            max_workers=12
         ) as executor:
 
-            futures = {
-
-                # IPQualityScore
+            jobs = {
                 "ipqs": executor.submit(
                     check_ipqs,
                     main_number,
                     region
                 ),
 
-                # Numverify
+                "pdl": executor.submit(
+                    check_pdl,
+                    main_number,
+                    region
+                ),
+
                 "numverify": executor.submit(
                     safe_call,
                     osint.check_numverify,
@@ -675,21 +639,18 @@ def search_phone(
                     region
                 ),
 
-                # Hudson Rock
                 "hudson_rock": executor.submit(
                     safe_call,
                     osint.check_hudsonrock,
                     main_number
                 ),
 
-                # Original SearchPhone Google
                 "google_exact": executor.submit(
                     safe_call,
                     osint.search_google,
                     main_number
                 ),
 
-                # Stronger Google search
                 "google_enriched": executor.submit(
                     search_google_enriched,
                     main_number,
@@ -697,28 +658,24 @@ def search_phone(
                     region
                 ),
 
-                # Google Maps businesses
                 "google_maps": executor.submit(
                     search_google_maps,
                     main_number,
                     local_number
                 ),
 
-                # GitHub
                 "github_international": executor.submit(
                     safe_call,
                     osint.search_github,
                     main_number
                 ),
 
-                # Reddit
                 "reddit_international": executor.submit(
                     safe_call,
                     osint.search_reddit,
                     main_number
                 ),
 
-                # DuckDuckGo
                 "duckduckgo_international": executor.submit(
                     safe_call,
                     osint.search_duckduckgo,
@@ -726,121 +683,77 @@ def search_phone(
                 )
             }
 
-
-            # =================================================
-            # ALSO SEARCH UAE LOCAL FORMAT
-            # =================================================
-
             if local_number:
-
-                futures[
-                    "github_local"
-                ] = executor.submit(
+                jobs["github_local"] = executor.submit(
                     safe_call,
                     osint.search_github,
                     local_number
                 )
 
-                futures[
-                    "reddit_local"
-                ] = executor.submit(
+                jobs["reddit_local"] = executor.submit(
                     safe_call,
                     osint.search_reddit,
                     local_number
                 )
 
-                futures[
-                    "duckduckgo_local"
-                ] = executor.submit(
+                jobs["duckduckgo_local"] = executor.submit(
                     safe_call,
                     osint.search_duckduckgo,
                     local_number
                 )
 
+            collected = {}
 
-            collected: Dict[str, Any] = {}
-
-
-            for name, future in futures.items():
-
+            for name, future in jobs.items():
                 try:
-
-                    collected[name] = (
-                        future.result(
-                            timeout=35
-                        )
+                    collected[name] = future.result(
+                        timeout=40
                     )
-
                 except Exception as e:
-
                     collected[name] = {
                         "error": str(e)
                     }
 
-
-        # =================================================
-        # IPQS IDENTITY
-        # =================================================
-
-        ipqs_raw = collected.get(
-            "ipqs",
-            {}
+        # Simplified identity sources
+        ipqs_identity = simplify_ipqs(
+            collected.get("ipqs", {})
         )
 
-        identity = simplify_ipqs(
-
-            ipqs_raw
-
-            if isinstance(
-                ipqs_raw,
-                dict
-            )
-
-            else {}
+        pdl_identity = simplify_pdl(
+            collected.get("pdl", {})
         )
 
-
-        # =================================================
-        # BASIC PHONE INFO
-        # =================================================
+        best_identity = build_best_identity(
+            ipqs_identity,
+            pdl_identity
+        )
 
         phone_info = safe_call(
-
             osint.validate_phone,
-
             main_number,
-
             region
         )
 
-
-        # =================================================
-        # FINAL RESULT
-        # =================================================
-
         return {
-
             "phone": phone,
-
             "region": region,
 
             "searched_variants": variants,
 
+            # MAIN RESULT
+            "best_identity": best_identity,
 
-            # ---------------------------------------------
-            # IMPORTANT IDENTITY SECTION
-            # ---------------------------------------------
+            # IDENTITY DATABASES
+            "identity": {
+                "ipqs": ipqs_identity,
+                "pdl": pdl_identity
+            },
 
-            "identity": identity,
-
-
-            # ---------------------------------------------
-            # PHONE DATABASES
-            # ---------------------------------------------
+            # RAW STATUS / DATABASE RESULTS
+            "ipqs": collected.get("ipqs"),
+            "pdl": collected.get("pdl"),
 
             "phone_info": phone_info,
-
-            "ipqs": ipqs_raw,
 
             "numverify": collected.get(
                 "numverify"
@@ -850,13 +763,8 @@ def search_phone(
                 "hudson_rock"
             ),
 
-
-            # ---------------------------------------------
-            # GOOGLE
-            # ---------------------------------------------
-
+            # WEB SEARCH
             "google": {
-
                 "exact": collected.get(
                     "google_exact",
                     []
@@ -873,13 +781,7 @@ def search_phone(
                 )
             },
 
-
-            # ---------------------------------------------
-            # GITHUB
-            # ---------------------------------------------
-
             "github": {
-
                 "international": collected.get(
                     "github_international",
                     []
@@ -891,13 +793,7 @@ def search_phone(
                 )
             },
 
-
-            # ---------------------------------------------
-            # REDDIT
-            # ---------------------------------------------
-
             "reddit": {
-
                 "international": collected.get(
                     "reddit_international",
                     []
@@ -909,13 +805,7 @@ def search_phone(
                 )
             },
 
-
-            # ---------------------------------------------
-            # DUCKDUCKGO
-            # ---------------------------------------------
-
             "duckduckgo": {
-
                 "international": collected.get(
                     "duckduckgo_international",
                     []
@@ -927,15 +817,13 @@ def search_phone(
                 )
             },
 
-
-            # ---------------------------------------------
-            # API STATUS
-            # ---------------------------------------------
-
             "source_status": {
-
                 "ipqs_configured": bool(
                     IPQS_KEY
+                ),
+
+                "pdl_configured": bool(
+                    PDL_API_KEY
                 ),
 
                 "serpapi_configured": bool(
@@ -944,9 +832,7 @@ def search_phone(
             }
         }
 
-
     except Exception as e:
-
         raise HTTPException(
             status_code=500,
             detail=str(e)
